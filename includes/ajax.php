@@ -342,73 +342,211 @@ if (!function_exists('tsml_ajax_geocode')) {
 add_action('wp_ajax_tsml_import', 'tsml_ajax_import');
 if (!function_exists('function_name')) {
 	function tsml_ajax_import() {
-		global $tsml_data_sources;
+		$limit = 25;
+		$import_result = tsml_import_next_batch_from_data_sources($limit);
 
-		$meetings	= get_option('tsml_import_buffer', array());
-		$errors		= array();
-		$limit		= 25;
+		$meetings = $import_result['counts']['meetings'];
+		$locations = $import_result['counts']['locations'];
+		$groups = $import_result['counts']['groups'];
+		$regions = $import_result['counts']['regions'];
 
-		//manage import buffer
-		if (count($meetings) > $limit) {
-			//slice off the first batch, save the remaining back to the import buffer
-			$remaining = array_slice($meetings, $limit);
-			update_option('tsml_import_buffer', $remaining);
-			$meetings = array_slice($meetings, 0, $limit);
-		} elseif (count($meetings)) {
-			//take them all and remove the option (don't wait, to prevent an endless loop)
-			$remaining = array();
-			delete_option('tsml_import_buffer');
+		$printable_errors = array();
+		foreach ($import_result['errors'] as $error) {
+			list($row_number, $meeting_name, $error_message) = $error;
+			$printable_errors[] = '<li value="' . $row_number . '">' . sprintf($error_message, $meeting_name) . '</li>';
 		}
 
-		//get lookups, todo consider adding regions to this
-		$locations = $groups = array();
-		$all_locations = tsml_get_locations();
-		foreach ($all_locations as $location) $locations[$location['formatted_address']] = $location['location_id'];
-		$all_groups = tsml_get_all_groups();
-		foreach ($all_groups as $group)	$groups[$group->post_title] = $group->ID;
+		$import_result['errors'] = $printable_errors;
+		$import_result['descriptions'] = array(
+			'meetings'	=> sprintf(_n('%s meeting', '%s meetings', $meetings, '12-step-meeting-list'), number_format_i18n($meetings)),
+			'locations'	=> sprintf(_n('%s location', '%s locations', $locations, '12-step-meeting-list'), number_format_i18n($locations)),
+			'groups'	=> sprintf(_n('%s group', '%s groups', $groups, '12-step-meeting-list'), number_format_i18n($groups)),
+			'regions'	=> sprintf(_n('%s region', '%s regions', $regions, '12-step-meeting-list'), number_format_i18n($regions)),
+		);
+
+		wp_send_json($import_result);
+	}
+}
+
+add_action('wp_ajax_tsml_break_import_lock', 'tsml_ajax_break_import_lock');
+function tsml_ajax_break_import_lock() {
+	wp_send_json(array(
+		'value_before' => get_option('tsml_import_locked_until', null),
+		'success' => update_option('tsml_import_locked_until', null),
+	));
+}
+
+//imports the next batch of meetings from whatever data-source has been marked for refreshing
+function tsml_import_next_batch_from_data_sources($limit = null) {
+	$errors = array();
+	$start_time_in_ms = microtime(true);
+
+	//imports are prevented from running in parallel by their projected end timestamp.
+	//if that end has elapsed, though, we can continue, the process surely has been killed/failed some time ago.
+    $tsml_import_locked_until = (int) get_option('tsml_import_locked_until', null);
+	$timestamp_now = time();
+	$is_import_still_running = $tsml_import_locked_until && $tsml_import_locked_until >= $timestamp_now;
+
+	if ($is_import_still_running) {
+		$errors[] = array(
+			null,
+			date('r', $tsml_import_locked_until),
+			__('An import is already running until %s! Doing nothing. Stopping.', '12-step-meeting-list'),
+		);
+
+		return array(
+			'errors' => $errors,
+		);
+	}
+
+	//lock the import process by telling other processes what our maximum runtime would be;
+    //in case of script failure and long assumed runtime this may result in long idle times, though
+    $tsml_import_started_at = $timestamp_now;
+    $max_execution_time = (int) ini_get('max_execution_time');
+    $tsml_import_locked_until = $tsml_import_started_at + $max_execution_time;
+	update_option('tsml_import_locked_until', $tsml_import_locked_until);
+
+	$remaining = get_option('tsml_import_buffer', array());
+	$imported_meetings = array();
+
+	$locations = array();
+	$all_locations = tsml_get_locations();
+	foreach ($all_locations as $location) {
+		$locations[$location['formatted_address']] = $location['location_id'];
+	}
+	$all_locations = null;
+
+	$groups = array();
+	$all_groups = tsml_get_all_groups();
+	foreach ($all_groups as $group) {
+		$groups[$group->post_title] = $group->ID;
+	}
+	$all_groups = null;
+
+	$regions = array();
+	$all_regions = tsml_get_all_regions();
+	foreach ($all_regions as $region) {
+		if (!isset($regions[$region->name])) {
+			$regions[$region->name] = array();
+		}
+
+		// include parent-term as sub-regions will test for that as well
+		$regions[$region->name][$region->parent] = $region->term_id;
+	}
+	$all_regions = null;
+
+	$districts = array();
+	$all_districts = tsml_get_all_districts();
+	foreach ($all_districts as $district) {
+		if (!isset($districts[$district->name])) {
+			$districts[$district->name] = array();
+		}
+
+		// include parent-term as sub-districts will test for that as well
+		$districts[$district->name][$district->parent] = $district->term_id;
+	}
+	$all_districts = null;
 
 		//passing post_modified and post_modified_gmt to wp_insert_post() below does not seem to work
 		//todo occasionally remove this to see if it is working
 		add_filter('wp_insert_post_data', 'tsml_import_post_modified', 99, 2);
 
-		foreach ($meetings as $meeting) {
+	$may_continue = true;
+	$time_we_should_pack_up_our_things = $tsml_import_started_at + 0.8 * $max_execution_time;
+
+	//we are collecting updates to the group/meetings contacts and sending them afterwards to save db requests
+	$contact_entity_updates = array();
+
+	while ($remaining && $may_continue) {
+		$meeting = array_shift($remaining);
+		$imported_meetings[] = $meeting;
+		$region_id = null;
+		$district_id = null;
+		$group_id = null;
+		$contact_entity_update = array();
+
+		$data_source_parent_region_id = empty($meeting['data_source_parent_region_id'])
+			? -1
+			: (int) $meeting['data_source_parent_region_id'];
+
+		if ($data_source_parent_region_id == -1) {
+			//no parent region has been selected, so use root
+			$data_source_parent_region_id = 0;
+		}
+
+		//we can either try to manage as many inserts time allows, or import in small batches, the ajax-way
+		if ($limit === null) {
+			$may_continue = $time_we_should_pack_up_our_things > time();
+		} else {
+			$may_continue = count($imported_meetings) < $limit;
+		}
+
 			//check address
 			if (empty($meeting['formatted_address'])) {
-				$errors[] = '<li value="' . $meeting['row'] . '">' . sprintf(__('No location information provided for <code>%s</code>.', '12-step-meeting-list'), $meeting['name']) . '</li>';
+				$errors[] = array(
+					$meeting['row'],
+					$meeting['name'],
+					__('No location information provided for <code>%s</code>.', '12-step-meeting-list'),
+				);
+
 				continue;
 			}
 
 			//geocode address
 			$geocoded = tsml_geocode($meeting['formatted_address']);
 
-			if ($geocoded['status'] == 'error')	{
-				$errors[] = '<li value="' . $meeting['row'] . '">' . $geocoded['reason'] . '</li>';
-				continue;
+		if ($geocoded['status'] == 'error')	{
+			$errors[] = array(
+				$meeting['row'],
+				$meeting['name'],
+				$geocoded['reason'],
+			);
+
+			continue;
+		}
+
+		//try to guess region from geocode
+		if (empty($meeting['region']) && !empty($geocoded['city'])) $meeting['region'] = $geocoded['city'];
+
+		//add region to taxonomy if it doesn't exist yet
+		if (!empty($meeting['region'])) {
+			if (isset($regions[$meeting['region']][$data_source_parent_region_id])) {
+				$region_id = $regions[$meeting['region']][$data_source_parent_region_id];
+			} else {
+				$term = wp_insert_term(
+					$meeting['region'],
+					'tsml_region',
+					array(
+						'parent' => $data_source_parent_region_id,
+					)
+				);
+				if (is_wp_error($term)) {
+					$errors[] = array(
+						$meeting['row'],
+						$meeting['name'],
+						$term->get_error_message(),
+					);
+
+					continue 1;
+				}
+				$regions[$meeting['region']][$data_source_parent_region_id] = $term['term_id'];
+				$region_id = intval($term['term_id']);
 			}
 
-			//try to guess region from geocode
-			if (empty($meeting['region']) && !empty($geocoded['city'])) $meeting['region'] = $geocoded['city'];
-
-			//add region to taxonomy if it doesn't exist yet
-			if (!empty($meeting['region'])) {
-				if (!$term = term_exists($meeting['region'], 'tsml_region', 0)) {
-					$term = wp_insert_term($meeting['region'], 'tsml_region', 0);
-				}
-				$region_id = intval($term['term_id']);
-
-				//can only have a subregion if you already have a region
-				if (!empty($meeting['sub_region'])) {
-					if (!$term = term_exists($meeting['sub_region'], 'tsml_region', $region_id)) {
-						$term = wp_insert_term($meeting['sub_region'], 'tsml_region', array('parent'=>$region_id));
-					}
+			//can only have a subregion if you already have a region
+			if (!empty($meeting['sub_region'])) {
+				if (isset($regions[$meeting['sub_region']][$region_id])) {
+					$region_id = $regions[$meeting['sub_region']][$region_id];
+				} else {
+					$term = wp_insert_term($meeting['sub_region'], 'tsml_region', array('parent'=>$region_id));
+					$regions[$meeting['sub_region']][$region_id] = $term['term_id'];
 					$region_id = intval($term['term_id']);
 				}
 			}
+		}
 
 			//handle group (can't have a group if group name not specified)
-			if (empty($meeting['group'])) {
-				$group_id = null;
-			} else {
+			if (!empty($meeting['group'])) {
 				if (!array_key_exists($meeting['group'], $groups)) {
 					$group_id = wp_insert_post(array(
 					  	'post_type'		=> 'tsml_group',
@@ -419,17 +557,23 @@ if (!function_exists('function_name')) {
 
 					//add district to taxonomy if it doesn't exist yet
 					if (!empty($meeting['district'])) {
-						if (!$term = term_exists($meeting['district'], 'tsml_district', 0)) {
+						if (isset($districts[$meeting['district']][0])) {
+							$district_id = $districts[$meeting['district']][0];
+						} else {
 							$term = wp_insert_term($meeting['district'], 'tsml_district', 0);
-						}
-						$district_id = intval($term['term_id']);
-
-						//can only have a subregion if you already have a region
-						if (!empty($meeting['sub_district'])) {
-							if (!$term = term_exists($meeting['sub_district'], 'tsml_district', $district_id)) {
-								$term = wp_insert_term($meeting['sub_district'], 'tsml_district', array('parent'=>$district_id));
-							}
+							$districts[$meeting['district']][0] = $term['term_id'];
 							$district_id = intval($term['term_id']);
+						}
+
+						//can only have a subdistrict if you already have a region
+						if (!empty($meeting['sub_district'])) {
+							if (isset($districts[$meeting['sub_district']][$district_id])) {
+								$district_id = $districts[$meeting['sub_district']][$district_id];
+							} else {
+								$term = wp_insert_term($meeting['sub_district'], 'tsml_district', array('parent'=>$district_id));
+								$districts[$meeting['sub_district']][$district_id] = $term['term_id'];
+								$district_id = intval($term['term_id']);
+							}
 						}
 
 						wp_set_object_terms($group_id, $district_id, 'tsml_district');
@@ -458,8 +602,10 @@ if (!function_exists('function_name')) {
 				wp_set_object_terms($location_id, $region_id, 'tsml_region');
 			}
 
+			$existing_meeting_id = isset($meeting['existing_meeting_id']) ? $meeting['existing_meeting_id'] : null;
+
 			//save meeting to this location
-			$options = array(
+			$meeting_post = array(
 				'post_title'		=> $meeting['name'],
 				'post_type'			=> 'tsml_meeting',
 				'post_status'		=> 'publish',
@@ -469,116 +615,153 @@ if (!function_exists('function_name')) {
 				'post_modified_gmt'	=> $meeting['post_modified_gmt'],
 				'post_author'		=> $meeting['post_author'],
 			);
-			if (!empty($meeting['slug'])) $options['post_name'] = $meeting['slug'];
-			$meeting_id = wp_insert_post($options);
+			if (!empty($meeting['slug'])) {
+				$meeting_post['post_name'] = $meeting['slug'];
+			}
+			if ($existing_meeting_id) {
+				$meeting_post['ID'] = $existing_meeting_id;
+				$meeting_id = $existing_meeting_id;
+				tsml_import_mark_meeting_as_not_stale($existing_meeting_id);
+				wp_update_post($meeting_post);
+			} else {
+				$meeting_id = wp_insert_post($meeting_post);
+			}
 
 			//add day and time(s) if not appointment meeting
 			if (!empty($meeting['time']) && (!empty($meeting['day']) || (string) $meeting['day'] === '0')) {
-				add_post_meta($meeting_id, 'day',  $meeting['day']);
-				add_post_meta($meeting_id, 'time', $meeting['time']);
-				if (!empty($meeting['end_time'])) add_post_meta($meeting_id, 'end_time', $meeting['end_time']);
+				update_post_meta($meeting_id, 'day',  $meeting['day']);
+				update_post_meta($meeting_id, 'time', $meeting['time']);
+
+				if (!empty($meeting['end_time'])) {
+					update_post_meta($meeting_id, 'end_time', $meeting['end_time']);
+				} elseif ($existing_meeting_id) {
+					delete_post_meta($meeting_id, 'end_time');
+				}
+			} elseif ($existing_meeting_id) {
+				delete_post_meta($meeting_id, 'day');
+				delete_post_meta($meeting_id, 'time');
+				delete_post_meta($meeting_id, 'end_time');
 			}
 
 			//add custom meeting fields if available
 			foreach (array('types', 'data_source', 'conference_url', 'conference_phone') as $key) {
-				if (!empty($meeting[$key])) add_post_meta($meeting_id, $key, $meeting[$key]);
+				if (!empty($meeting[$key])) {
+					update_post_meta($meeting_id, $key, $meeting[$key]);
+				}
 			}
-
-			// Add Group Id and group specific info if applicable
-			if (!empty($group_id)) {
-				//link group to meeting
-				add_post_meta($meeting_id, 'group_id', $group_id);
-			}
+			update_post_meta($meeting_id, 'data_source_id', $meeting['id']);
+			update_post_meta($meeting_id, 'group_id', $group_id);
 
 			//handle contact information (could be meeting or group)
 			$contact_entity_id = empty($group_id) ? $meeting_id : $group_id;
+
 			for ($i = 1; $i <= GROUP_CONTACT_COUNT; $i++) {
 				foreach (array('name', 'phone', 'email') as $field) {
 					$key = 'contact_' . $i . '_' . $field;
-					if (!empty($meeting[$key])) update_post_meta($contact_entity_id, $key, $meeting[$key]);
+
+					if (!empty($meeting[$key])) {
+						$contact_entity_update[$key] = $meeting[$key];
+					} else {
+						$contact_entity_update[$key] = null;
+					}
 				}
 			}
 
-			if (!empty($meeting['website'])) {
-				update_post_meta($contact_entity_id, 'website', esc_url_raw($meeting['website'], array('http', 'https')));
+		foreach (array('website', 'website_2') as $key) {
+			if (!empty($meeting[$key])) {
+				$contact_entity_update[$key] = esc_url_raw($meeting[$key], array('http', 'https'));
+			} else {
+				$contact_entity_update[$key] = null;
 			}
-
-			if (!empty($meeting['website_2'])) {
-				update_post_meta($contact_entity_id, 'website_2', esc_url_raw($meeting['website_2'], array('http', 'https')));
-			}
-
-			if (!empty($meeting['email'])) {
-				update_post_meta($contact_entity_id, 'email', $meeting['email']);
-			}
-
-			if (!empty($meeting['phone'])) {
-				update_post_meta($contact_entity_id, 'phone', $meeting['phone']);
-			}
-
-			if (!empty($meeting['mailing_address'])) {
-				update_post_meta($contact_entity_id, 'mailing_address', $meeting['mailing_address']);
-			}
-
-			if (!empty($meeting['venmo'])) {
-				update_post_meta($contact_entity_id, 'venmo', $meeting['venmo']);
-			}
-
-			if (!empty($meeting['square'])) {
-				update_post_meta($contact_entity_id, 'square', $meeting['square']);
-			}
-
-			if (!empty($meeting['paypal'])) {
-				update_post_meta($contact_entity_id, 'paypal', $meeting['paypal']);
-			}
-
-			if (!empty($meeting['last_contact']) && ($last_contact = strtotime($meeting['last_contact']))) {
-				update_post_meta($contact_entity_id, 'last_contact', date('Y-m-d', $last_contact));
-			}
-
 		}
 
-		//have to update the cache of types in use
-		tsml_cache_rebuild();
-
-		//have to update the cache of types in use
-		tsml_update_types_in_use();
-
-		//update viewport biasing for geocoding
-		tsml_bounds();
-
-		//remove post_modified thing added earlier
-		remove_filter('wp_insert_post_data', 'tsml_import_post_modified', 99);
-
-		//send json result to browser
-		$meetings  = tsml_count_meetings();
-		$locations = tsml_count_locations();
-		$regions   = tsml_count_regions();
-		$groups	= tsml_count_groups();
-
-		//update the data source counts for the database
-		foreach ($tsml_data_sources as $url => $props) {
-			$tsml_data_sources[$url]['count_meetings'] = count(tsml_get_data_source_ids($url));
-		}
-		update_option('tsml_data_sources', $tsml_data_sources);
-
-		//now format the counts for JSON output
-		foreach ($tsml_data_sources as $url => $props) {
-			$tsml_data_sources[$url]['count_meetings'] = number_format($props['count_meetings']);
+		foreach (array('email', 'phone', 'mailing_address', 'venmo', 'square', 'paypal') as $key) {
+			if (!empty($meeting[$key])) {
+				$contact_entity_update[$key] = $meeting[$key];
+			} else {
+				$contact_entity_update[$key] = null;
+			}
 		}
 
-		wp_send_json(array(
-			'errors'		=> $errors,
-			'remaining'		=> count($remaining),
-			'counts'		=> compact('meetings', 'locations', 'regions', 'groups'),
-			'data_sources' 	=> $tsml_data_sources,
-			'descriptions'	=> array(
-				'meetings'	=> sprintf(_n('%s meeting', '%s meetings', $meetings, '12-step-meeting-list'), number_format_i18n($meetings)),
-				'locations'	=> sprintf(_n('%s location', '%s locations', $locations, '12-step-meeting-list'), number_format_i18n($locations)),
-				'groups'	=> sprintf(_n('%s group', '%s groups', $groups, '12-step-meeting-list'), number_format_i18n($groups)),
-				'regions'	=> sprintf(_n('%s region', '%s regions', $regions, '12-step-meeting-list'), number_format_i18n($regions)),
-			),
-		));
+		if (!empty($meeting['last_contact']) && ($last_contact = strtotime($meeting['last_contact']))) {
+			$contact_entity_update['last_contact'] = date('Y-m-d', $last_contact);
+		} else {
+			$contact_entity_update['last_contact'] = null;
+		}
+
+		$contact_entity_updates[$contact_entity_id] = $contact_entity_update;
 	}
+
+	//now quickly update collected contact entities
+	foreach ($contact_entity_updates as $contact_entity_id => $contact_entity_update) {
+		foreach ($contact_entity_update as $key => $value) {
+			if ($value === null) {
+				delete_post_meta($contact_entity_id, $key);
+			} else {
+				update_post_meta($contact_entity_id, $key, $value);
+			}
+		}
+	}
+	$contact_entity_updates = null;
+
+	//remove post_modified thing added earlier
+	remove_filter('wp_insert_post_data', 'tsml_import_post_modified', 99);
+
+	do_action('tsml_refresh_cache_after_import');
+
+	//send json result to browser
+	$meetings  = tsml_count_meetings();
+	$locations = tsml_count_locations();
+	$regions   = tsml_count_regions();
+	$groups	= tsml_count_groups();
+
+	//now format the counts for JSON output
+	$tsml_data_sources = get_option('tsml_data_sources', array());
+	foreach ($tsml_data_sources as $url => $data_source) {
+		$tsml_data_sources[$url]['count_meetings'] = number_format($data_source['count_meetings']);
+	}
+
+	if ($remaining) {
+		update_option('tsml_import_buffer', $remaining);
+	} else {
+		foreach ($tsml_data_sources as $data_source_url => $data_source) {
+			tsml_import_delete_stale_meetings_after_update($data_source_url);
+		}
+
+		delete_option('tsml_import_buffer');
+	}
+
+	//releases lock on import
+	update_option('tsml_import_locked_until', null);
+
+	$duration_in_ms = microtime(true) - $start_time_in_ms;
+
+	return array(
+		'errors' => $errors,
+		'remaining' => count($remaining),
+		'counts' => compact('meetings', 'locations', 'regions', 'groups'),
+		'data_sources' => $tsml_data_sources,
+		'duration_in_ms' => $duration_in_ms,
+	);
+}
+
+add_action('tsml_refresh_cache_after_import', 'tsml_refresh_cache_after_import');
+function tsml_refresh_cache_after_import() {
+	//have to update the cache of types in use
+	tsml_cache_rebuild();
+
+	//have to update the cache of types in use
+	tsml_update_types_in_use();
+
+	//update viewport biasing for geocoding
+	tsml_bounds();
+
+	//update the data source counts for the database
+	$tsml_data_sources = get_option('tsml_data_sources', array());
+	foreach ($tsml_data_sources as $url => $props) {
+		$tsml_data_sources[$url]['count_meetings'] = count(tsml_get_data_source_ids($url));
+	}
+	update_option('tsml_data_sources', $tsml_data_sources);
 }
 
 //api ajax function
@@ -669,7 +852,7 @@ function tsml_ajax_meeting_link() {
 		wp_send_json_error();
 	}
 	$meeting_id = intval( $_GET['meeting_id'] );
-	$url        = get_post_meta( $meeting_id, 'conference_url', true );
+	$url		= get_post_meta( $meeting_id, 'conference_url', true );
 	if ( $url ) {
 		wp_send_json_success( [ 'meeting' => $url ] );
 	} else {
@@ -694,7 +877,7 @@ function tsml_ajax_phone_link() {
 		wp_send_json_error();
 	}
 	$meeting_id = intval( $_GET['meeting_id'] );
-	$phone      = get_post_meta( $meeting_id, 'conference_phone', true );
+	$phone	  = get_post_meta( $meeting_id, 'conference_phone', true );
 	if ( $phone ) {
 		if ( false === strpos( $phone, 'tel:' ) ) {
 			wp_send_json_success( [ 'phone' => 'tel:' . esc_attr( $phone ) ] );

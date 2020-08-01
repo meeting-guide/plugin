@@ -225,19 +225,19 @@ To apply these changes, you must go to Settings > Permalinks and click "Save Cha
 * Improved URL screening for csv/json imports.
 * Improved front end styling for meetings.
 
-= 3.6.4 = 
+= 3.6.4 =
 * Updated CSV import/export and template to reflect added fields.
 * Added abiility to bulk add/remove Temporary Closure type.
 * Add two additional online conference types.
 * Updated online phone button.
 * Other bug fixes.
 
-= 3.6.3 = 
+= 3.6.3 =
 * Fixed issue with setting null for conference types.
 * Fixed JSON feed not importing online conference info, and Venmo info.
 * Added Skype conference type.
 
-= 3.6.2 = 
+= 3.6.2 =
 * Changes online meeting information from group to individual meeting (Issue #82).
 * Adds front end styling for online meetings.
 
@@ -250,7 +250,7 @@ To apply these changes, you must go to Settings > Permalinks and click "Save Cha
 
 = 3.5.4 =
 * Added temporary closure styling to widget.
- 
+
 = 3.5.3 =
 * Changes to front end display supporting temporary closure tag.
 
