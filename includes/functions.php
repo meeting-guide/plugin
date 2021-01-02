@@ -550,7 +550,8 @@ function tsml_front_page($wp_query){
 //function: request accurate address information from google
 //used:		tsml_ajax_import(), tsml_ajax_geocode()
 function tsml_geocode($address) {
-	global $tsml_curl_handle, $tsml_language, $tsml_google_overrides, $tsml_bounds;
+
+	global $tsml_google_overrides;
 
 	//check overrides first before anything
 	if (array_key_exists($address, $tsml_google_overrides)) {
@@ -563,11 +564,60 @@ function tsml_geocode($address) {
 	//filter out any empty addresses that got added due to a bug
 	$addresses = array_filter($addresses, 'tsml_has_address');
 
-	//if key exists && approximate is set for that address, return it
-	if (array_key_exists($address, $addresses) && !empty($addresses[$address]['approximate'])) {
+	//if key exists, return it
+	if (array_key_exists($address, $addresses)) {
+		// If approximate is empty, assume it's not approximate
+		if (empty($addresses[$address]['approximate'])) {
+		  $addresses[$address]['approximate'] = 'no';
+		}
 		$addresses[$address]['status'] = 'cache';
 		return $addresses[$address];
 	}
+
+	$map_service = "none";
+	
+	$tsml_map_key = get_option( 'tsml_google_maps_key' );	
+	if (!empty($tsml_map_key)) {
+		$map_service = "google";
+	} else {
+		$tsml_map_key = get_option( 'tsml_mapbox_key' );		
+		if (!empty($tsml_map_key))
+			$map_service = "mapbox";
+	}
+
+	switch ($map_service) {
+	    case 'google':
+	    	$response = tsml_geocode_google($address, $tsml_map_key);
+	        break;
+	    case 'mapbox':
+	    	$response = tsml_geocode_mapbox($address, $tsml_map_key);
+	        break;
+    	default:
+			return array (
+				'status' => 'error',
+				'reason' => 'You do not have a Google or Mapbox Map API key installed.'
+			);
+	}
+
+	if ( $response['status'] == 'error' ) {
+		return array(
+			'status' => $response['status'],
+			'reason' => $response['reason'],
+		);
+	}
+
+	//cache result
+	$addresses[$address] = $response;
+	update_option('tsml_addresses', $addresses);
+
+	//add a status and return it
+	$response['status'] = 'geocode';
+	return $response;
+}
+
+function tsml_geocode_mapbox($address, $tsml_map_key) {
+
+	global $tsml_curl_handle, $tsml_language, $tsml_google_overrides, $tsml_bounds;
 
 	//initialize curl handle if necessary
 	if (!$tsml_curl_handle) {
@@ -582,7 +632,132 @@ function tsml_geocode($address) {
 
 	//start list of options for geocoding request
 	$options = array(
-		'key' => 'AIzaSyCwIhOSfKs47DOe24JXM8nxfw1gC05BaiU',
+		'access_token' => $tsml_map_key,
+		'limit' => "1",
+		'language' => $tsml_language,
+	);
+
+	//bias the viewport if we know the bounds
+	if ($tsml_bounds) {
+		$options['bbox'] = $tsml_bounds['west'] . ',' . $tsml_bounds['south'] . ',' . $tsml_bounds['east'] . ',' . $tsml_bounds['north'];
+	}
+
+	//send request to google
+	curl_setopt($tsml_curl_handle, CURLOPT_URL, 'https://api.mapbox.com/geocoding/v5/mapbox.places/' . urlencode($address) . ".json?" . http_build_query($options));
+	curl_setopt($tsml_curl_handle, CURLOPT_RETURNTRANSFER, true);
+
+	// if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+	// 	$myfile = fopen("../debug.txt", "a") or die("Unable to open file!");
+	// 	$my_results = print_r(curl_getinfo($tsml_curl_handle), true);
+	// 	file_put_contents('../debug.txt', print_r($my_results, true));
+	// }
+
+	$result = curl_exec($tsml_curl_handle);
+
+	$httpcode = curl_getinfo($tsml_curl_handle, CURLINFO_HTTP_CODE);
+
+	//could not connect error
+	if ($result === false) {
+		return array(
+			'status' => 'error',
+			'reason' => 'Mapbox could not validate the address <code>' . $address . '</code>. Response was <code>' . curl_error($tsml_curl_handle) . '</code>',
+		);
+	}
+
+	//decode result
+	$data = json_decode($result);
+
+	if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+		$myfile = fopen("../debug.txt", "a") or die("Unable to open file!");
+		$my_results = print_r($data, true);
+		file_put_contents('../debug.txt', print_r($my_results, true));
+	}
+
+	//if over query limit, wait two seconds and retry, or then exit
+	if ($httpcode === '429') {	// OVER_QUERY_LIMIT
+		sleep(2);
+		$result = curl_exec($tsml_curl_handle);
+		$httpcode = curl_getinfo($tsml_curl_handle, CURLINFO_HTTP_CODE);
+
+		//could not connect error
+		if ($result === false) {
+			return array(
+				'status' => 'error',
+				'reason' => 'Mapbox could not validate the address <code>' . $address . '</code>. Response was <code>' . curl_error($tsml_curl_handle) . '</code>',
+			);
+		}
+
+		//decode result
+		$data = json_decode($result);
+
+		//if we're still over the limit, stop
+		if ($httpcode === '429') {	// OVER_QUERY_LIMIT
+			return array(
+				'status' => 'error',
+				'reason' => 'You are over the rate limit for the Mapbox Geocoding API.'
+			);
+		}
+	}
+
+	if (!empty($data->message))
+	{
+		return array(
+			'status' => 'error',
+			'reason' => 'Mapbox returned ' . $data->message,
+		);
+	}
+
+	//if result is otherwise bad, stop
+	if (empty($data->features[0]->place_name)) {
+		return array(
+			'status' => 'error',
+			'reason' => 'Mapbox gave an unexpected response for address <code>' . $address . '</code>. Response was <pre>' . var_export($data, true) . '</pre>',
+		);
+	}
+
+	//check our overrides array again in case mapbox is wrong
+	if (array_key_exists($data->features[0]->place_name, $tsml_google_overrides)) {
+		$response = $tsml_google_overrides[$data->features[0]->place_name];
+	} else {
+		//start building response
+		$response = array(
+			'formatted_address' => $data->features[0]->place_name,
+			'latitude' => $data->features[0]->center[1],
+			'longitude' => $data->features[0]->center[0],
+			'approximate' => ($data->features[0]->geometry->type === 'Point') ? 'no' : 'yes',
+			'city' => null,
+		);
+
+		//get city, we might need it for the region, and we are going to cache it
+		foreach ($data->features[0]->context as $component) {
+			if (substr($component->id, 0, 5) === "place") {
+				$response['city'] = $component->text;
+			}
+		}
+	
+	}
+
+	return $response;	
+}
+
+function tsml_geocode_google($address, $tsml_map_key) {
+
+	global $tsml_curl_handle, $tsml_language, $tsml_google_overrides, $tsml_bounds;
+
+	//initialize curl handle if necessary
+	if (!$tsml_curl_handle) {
+		$tsml_curl_handle = curl_init();
+		curl_setopt_array($tsml_curl_handle, array(
+			CURLOPT_HEADER => 0,
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_TIMEOUT => 60,
+			CURLOPT_SSL_VERIFYPEER => false,
+		));
+	}
+
+	//start list of options for geocoding request
+	$options = array(
+		'key' => $tsml_map_key,
 		'address' => $address,
 		'language' => $tsml_language,
 	);
@@ -676,13 +851,7 @@ function tsml_geocode($address) {
 		}
 	}
 
-	//cache result
-	$addresses[$address] = $response;
-	update_option('tsml_addresses', $addresses);
-
-	//add a status and return it
-	$response['status'] = 'geocode';
-	return $response;
+	return $response;	
 }
 
 //function: Ensure location->approximate set through geocoding and updated
