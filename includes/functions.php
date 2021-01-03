@@ -619,6 +619,10 @@ function tsml_geocode_mapbox($address, $tsml_map_key) {
 
 	global $tsml_curl_handle, $tsml_language, $tsml_google_overrides, $tsml_bounds;
 
+	// if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+	// 	file_put_contents('../debug.txt', "");
+	// }
+
 	//initialize curl handle if necessary
 	if (!$tsml_curl_handle) {
 		$tsml_curl_handle = curl_init();
@@ -637,20 +641,52 @@ function tsml_geocode_mapbox($address, $tsml_map_key) {
 		'language' => $tsml_language,
 	);
 
+	// if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+
+	// 	if ($tsml_bounds) {
+
+	// 		// Output a polygon to visulise on test app
+
+	// 	    // [-122.08900682192, 37.08951465024],     //W S
+	// 	    // [-122.08358527808, 37.08951465024],     //E S
+	// 	    // [-122.08358527808, 37.09090184976],     //E N
+	// 	    // [-122.08900682192, 37.09090184976],     //W N
+	// 	    // [-122.08900682192, 37.08951465024]      //W S
+		
+	// 		$out = '';
+
+	// 		$out .= '[' + $tsml_bounds['west'] . ', ' . $tsml_bounds['south'] . '],';
+	// 		$out .= '[' + $tsml_bounds['east'] . ', ' . $tsml_bounds['south'] . '],';
+	// 		$out .= '[' + $tsml_bounds['east'] . ', ' . $tsml_bounds['north'] . '],';
+	// 		$out .= '[' + $tsml_bounds['west'] . ', ' . $tsml_bounds['north'] . '],';
+	// 		$out .= '[' + $tsml_bounds['west'] . ', ' . $tsml_bounds['south'] . ']';
+	// 		// file_put_contents('../debug.txt', $out, FILE_APPEND);
+	// 	}       
+	// }
+
 	//bias the viewport if we know the bounds
 	if ($tsml_bounds) {
-		$options['bbox'] = $tsml_bounds['west'] . ',' . $tsml_bounds['south'] . ',' . $tsml_bounds['east'] . ',' . $tsml_bounds['north'];
+		// $options['bbox'] = $tsml_bounds['west'] . ',' . $tsml_bounds['south'] . ',' . $tsml_bounds['east'] . ',' . $tsml_bounds['north'];
+
+		// Google contains a strictBounds property which is FALSE by default. MapBox does not have this property and restircts search to inside the bounds. Instead we will use the proximity property.
+
+		//find center point of boundry to give preference
+		$centerlon =  ($tsml_bounds['west'] + $tsml_bounds['east']) / 2;
+		$centerlat =  ($tsml_bounds['north'] + $tsml_bounds['south']) / 2;
+
+		$options['proximity'] = $centerlon . ',' . $centerlat;
+
+		//file_put_contents('../debug.txt', $options['proximity'], FILE_APPEND);
 	}
 
-	//send request to google
+	//send request to mapbox
 	curl_setopt($tsml_curl_handle, CURLOPT_URL, 'https://api.mapbox.com/geocoding/v5/mapbox.places/' . urlencode($address) . ".json?" . http_build_query($options));
 	curl_setopt($tsml_curl_handle, CURLOPT_RETURNTRANSFER, true);
 
-	// if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-	// 	$myfile = fopen("../debug.txt", "a") or die("Unable to open file!");
-	// 	$my_results = print_r(curl_getinfo($tsml_curl_handle), true);
-	// 	file_put_contents('../debug.txt', print_r($my_results, true));
-	// }
+	if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+		$out = print_r(curl_getinfo($tsml_curl_handle, CURLINFO_EFFECTIVE_URL), true);
+		file_put_contents('../debug.txt', $out, FILE_APPEND);
+	}
 
 	$result = curl_exec($tsml_curl_handle);
 
@@ -667,11 +703,10 @@ function tsml_geocode_mapbox($address, $tsml_map_key) {
 	//decode result
 	$data = json_decode($result);
 
-	if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-		$myfile = fopen("../debug.txt", "a") or die("Unable to open file!");
-		$my_results = print_r($data, true);
-		file_put_contents('../debug.txt', print_r($my_results, true));
-	}
+	// if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+	// 	$out = print_r($data, true);
+	// 	file_put_contents('../debug.txt', $out, FILE_APPEND);
+	// }
 
 	//if over query limit, wait two seconds and retry, or then exit
 	if ($httpcode === '429') {	// OVER_QUERY_LIMIT
