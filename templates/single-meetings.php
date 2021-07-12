@@ -32,6 +32,9 @@ function tsml_body_class($classes) {
 
 	// Add the attendance option class to the body tag
 	$classes[] = 'attendance-' . sanitize_title($meeting->attendance_option);
+  if (($meeting->attendance_option === 'online') && ($meeting->approximate === 'no')) {
+    $classes[] = 'attendance-inactive';
+  }
 
 	return $classes;
 }
