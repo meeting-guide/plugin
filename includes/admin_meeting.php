@@ -32,8 +32,6 @@ function tsml_admin_init() {
 	if (version_compare($tsml_version, TSML_VERSION, '<')) {
     db_update_remove_all_approximate_location_cache();
     db_update_remove_all_is_approximate_location_meta();
-		// db_update_addresses_cache_approximate_location();
-		// db_update_tsml_locations_approximate_location();
 		update_option('tsml_version', TSML_VERSION);
 		flush_rewrite_rules();
 	};
@@ -46,11 +44,6 @@ function tsml_admin_init() {
         global $post, $tsml_days, $tsml_programs, $tsml_program, $tsml_nonce, $tsml_types_in_use;
 
 		$meeting = tsml_get_meeting();
-
-		//time is before the end of april and not currently using temporary closure
-		if (!in_array('TC', $tsml_types_in_use) && time() < strtotime('2020-04-30')) {
-			tsml_alert('Please note: a new “Temporary Closure” meeting type has recently been added. Use this to indicate meetings that are temporarily not meeting. Find it under “View all” below.', 'warning');
-		}
 
         if (!empty($meeting->data_source)) {
             tsml_alert(__('This meeting was imported from an external data source. Any changes you make here will be overwritten when you refresh the data.', '12-step-meeting-list'), 'warning');
